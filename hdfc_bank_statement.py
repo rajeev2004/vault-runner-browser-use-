@@ -15,6 +15,13 @@ sensitive_data = {
 }
 browser_session = BrowserSession(keep_alive = True, allowed_domains = ['now.hdfc.bank.in'])
 
+class HDFCTransaction(BaseModel):
+    date: str
+    description: str
+    reference_number: str
+    amount: str
+    closing_balance: str
+
 class AccountCheck(BaseModel):
     login_attempted: bool
     login_error: str
@@ -24,6 +31,8 @@ class AccountCheck(BaseModel):
     unexpected_state: str
     statement_page_reached: bool
     statement_page_description: str
+    otp_submission_result: str
+    transactions: list[HDFCTransaction]
 
 def log_step(browser_state, agent_output, step_number):
         log = {
@@ -46,9 +55,10 @@ agent = Agent(
     5. If an OTP entry screen appears at any point — during login or afterward — stop completely, set otp_screen_reached to true, and do nothing further.
     6. If login succeeds with no CAPTCHA or OTP, navigate to wherever account statements or transaction history are viewable.
     7. If reaching that page triggers anything covered by rules 3-5, apply them there too.
-    8. Once you reach the statement page (or determine you cannot), set statement_page_reached accordingly and describe what you find in statement_page_description — what filters exist, what fields are shown. Do not click anything that submits a transfer or payment.
-    9. Before setting any field, gather concrete evidence using the evaluate action — read the actual page URL and visible text. Do not rely on a visual impression alone.
-    10. If anything happens that doesn't match these cases, describe it in unexpected_state; otherwise leave that field empty.""",
+    8. Once you reach the statement page, select "Recent Transactions" as the statement period. For each transaction row visible, click its panel toggle to expand it and reveal its full details, then use the evaluate action to extract that row's date, description, reference number, amount, and closing balance from the expanded panel. Repeat for every row visible on the page. Populate the transactions list only with data that literally appears in the JavaScript extraction results — do not summarize, paraphrase, or add any detail not directly present. If a field is genuinely not available even after expanding a row, use an empty string rather than guessing.
+    9. After extracting all rows currently visible, check whether more transactions exist beyond what's shown — for example, a "Next" control, page numbers, or text like "1-10 of 20". If more exist, navigate to the next page and repeat the same expand-and-extract process for every row there, adding to the same transactions list rather than replacing it. Continue until every page has been covered or no further page control exists. Do not click a pagination control more than 5 times in a row, to avoid looping indefinitely if the page doesn't behave as expected.
+    10. Before setting any field, gather concrete evidence using the evaluate action — read the actual page URL and visible text. Do not rely on a visual impression alone.
+    11. If anything happens that doesn't match these cases, describe it in unexpected_state; otherwise leave that field empty.""",
     use_vision = False,
     llm = llm,
     fallback_llm = fallback_llm,
@@ -78,6 +88,19 @@ async def main():
     print(f"Unexpected state: {response.unexpected_state}")
     print(f"Statement page reached: {response.statement_page_reached}")
     print(f"Statement page description: {response.statement_page_description}")
+    if (response.otp_screen_reached):
+        otp_code = input("Check your phone for the OTP and enter it here: ")
+        sensitive_data['x_otp'] = otp_code
+        agent.add_new_task("Enter x_otp into the OTP field and submit it. Set otp_submission_result to describe exactly what happened — success and what page you reached, or the exact error shown.")
+        history2 = await agent.run()
+        final_response = history2.structured_output
+        if final_response is None:
+            print("The OTP submission run never produced a result — check the log for what went wrong.")
+        else:
+            print(f"OTP submission result: {final_response.otp_submission_result}")
+    print(f"Transactions found: {len(response.transactions)}")
+    for t in response.transactions:
+        print(f"  {t.date} | {t.description} | {t.reference_number} | {t.amount} | {t.closing_balance}")
     await browser_session.kill()
 
 asyncio.run(main())
