@@ -79,6 +79,7 @@ def get_valid_date(prompt):
 #function used for chekcing final results and agent's state, and whether the judge is okay with the agent behaviour or not
 def check_result(history, run_name):
     result = history.structured_output
+    print(f"Token usage for {run_name}: {history.usage}")
     if result is None:
         print(f"{run_name} never produced a result — check the log for what went wrong.")
         return None, False
@@ -142,7 +143,7 @@ async def select_period_and_extract(agent, available_periods):
                     chosen_filter = input("Which transaction filter would you like?: ").strip()
                     while chosen_filter not in filter_discovery_check.available_transaction_filters:
                         chosen_filter = input(f"Please choose one of: {', '.join(filter_discovery_check.available_transaction_filters)}: ").strip()
-                filter_instruction = f"first select the transaction-type filter to '{chosen_filter}' if it is not already set, then use the evaluate action to read the filter control's actual current value and set applied_transaction_filter to exactly what that evaluate call returns" if chosen_filter else "leave the transaction-type filter as-is and set applied_transaction_filter to its current value, read via evaluate"
+                filter_instruction = f"first select the transaction-type filter to '{chosen_filter}' if it is not already set, then use the evaluate action to read the filter control's actual current selected option TEXT (its human-readable label, not any underlying value attribute or code), and set applied_transaction_filter to exactly that label text" if chosen_filter else "leave the transaction-type filter as-is and set applied_transaction_filter to its current selected option text (the human-readable label, not any underlying value attribute or code), read via evaluate"
                 agent.add_new_task(f"Now, for the currently selected statement period, {filter_instruction}. Then expand every visible transaction row and use the evaluate action to extract each row's date, description, reference number, amount, and closing balance. After collecting the currently visible rows, use the evaluate action to explicitly look for a real 'Next' button, arrow, or page-number control — for example, an element whose aria-label or text contains 'Next', or numbered page links. Do not conclude that no further pages exist based on an identifier search alone; you must actually check for a visible, working pagination control. If one is found and enabled, click it and repeat row expansion and extraction for the new page, adding to the same transactions list rather than replacing it. Continue until the pagination control is disabled, absent, or you have clicked it 5 times, whichever comes first. Populate the transactions list with only what the JavaScript extraction literally returns.")
                 period_transactions_history = await agent.run()
                 period_transactions_check, ok = check_result(period_transactions_history, "Transaction extraction result")
@@ -178,7 +179,8 @@ agent = Agent(
     sensitive_data = sensitive_data,
     browser_session = browser_session,
     register_new_step_callback = log_step,
-    output_model_schema = AccountCheck
+    output_model_schema = AccountCheck,
+    calculate_cost = True
 )
 
 async def main():
