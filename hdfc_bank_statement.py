@@ -5,6 +5,7 @@ import asyncio
 import json
 from datetime import datetime
 import os
+import csv
 
 load_dotenv()
 llm = ChatOpenAI(model = 'gpt-5.6-terra')
@@ -40,6 +41,11 @@ class AccountCheck(BaseModel):
     otp_submission_result: str
     otp_submission_succeeded: bool
     transactions: list[HDFCTransaction]
+    available_periods: list[str]
+    period_selection_succeeded: bool
+    period_selection_error: str
+    download_only: bool
+    download_result: str
 
 def log_step(browser_state, agent_output, step_number):
         log = {
@@ -53,6 +59,84 @@ def write_log(entry):
     with open("statement_log.json1", "a") as f:
         f.write(f"{json.dumps(entry)}\n")
 
+def get_valid_date(prompt):
+    while True:
+        date_str = input(prompt).strip()
+        try:
+            parsed = datetime.strptime(date_str, "%d-%m-%Y")
+        except ValueError:
+            print("That doesn't look like a valid date. Please use DD-MM-YYYY format (e.g. 01-06-2026).")
+            continue
+        if parsed.date() >= datetime.now().date():
+            print("HDFC's statement data likely doesn't cover today or future dates. Please enter an earlier date.")
+            continue
+        return date_str
+
+def check_result(history, run_name):
+    result = history.structured_output
+    if result is None:
+        print(f"{run_name} never produced a result — check the log for what went wrong.")
+        return None, False
+    judgement = history.history[-1].result[-1].judgement
+    if judgement is None:
+        print(f"No judge verdict was produced for {run_name.lower()} — treat this result as unverified.")
+    elif not judgement.verdict:
+        print(f"⚠️ WARNING: The judge does NOT agree {run_name.lower()} was properly verified.")
+        print(f"Judge's reason: {judgement.failure_reason}")
+    return result, True
+
+def save_transactions_to_csv(transactions, period_name):
+    filename = f"transactions_{period_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    with open(filename, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Date", "Description", "Reference Number", "Amount", "Closing Balance"])
+        for txn in transactions:
+            writer.writerow([txn.date, txn.description, txn.reference_number, txn.amount, txn.closing_balance])
+    return filename
+
+async def select_period_and_extract(agent, available_periods):
+    max_attempts = 3
+    attempt = 0
+    succeeded = False
+    while attempt < max_attempts and not succeeded:
+        attempt += 1
+        for period in available_periods:
+            print(f"{period}\n")
+        selected_period = input("Choose one of the periods to fetch the transaction history: ")
+        if selected_period == "Custom Date":
+            while True:
+                from_date = get_valid_date("Enter the From date (DD-MM-YYYY): ")
+                to_date = get_valid_date("Enter the To date (DD-MM-YYYY): ")
+                if datetime.strptime(from_date, "%d-%m-%Y") <= datetime.strptime(to_date, "%d-%m-%Y"):
+                    break
+                print("The From date must come before the To date. Please enter both again.")
+            period_instruction = f'select "Custom Date" as the statement period, then enter "{from_date}" as the From Date and "{to_date}" as the To Date'
+        else:
+            period_instruction = f'select "{selected_period}" as the statement period'
+        agent.add_new_task(f"On the statement page, {period_instruction}, then confirm whether the selection succeeded — set period_selection_succeeded to true only if you can point to concrete evidence, or false with the problem described in period_selection_error. Once selection succeeds, use the evaluate action to concretely determine the page's state by querying for two specific things separately: (1) actual transaction row/panel elements — for example, elements whose id or class indicates a transaction row, not just a generic <table> count — and (2) the presence of Download and/or Email buttons. Do not infer the page's state from a table element count alone, and do not report any specific number of transactions or pagination text (like '20 transactions' or 'Showing 1-10 of 20') unless that exact text was literally returned by an evaluate call. Only set download_only to true if your evaluate result shows Download/Email controls and zero real transaction row elements found. In that case, select the 'Delimited' format if available (otherwise Excel), click Download, and set download_result to the exact filename or confirmation shown — or the exact error if it failed. Do NOT click Email under any circumstances. If your evaluate result instead shows one or more real transaction row elements, set download_only to false; row expansion and extraction will happen in a separate follow-up step.")
+        period_history = await agent.run()
+        period_check, ok = check_result(period_history, "Period selection result")
+
+        if ok and period_check.period_selection_succeeded:
+            succeeded = True
+            print(f"Period '{selected_period}' selected successfully.")
+
+            if period_check.download_only:
+                print(f"'{selected_period}' offered only a Download option. Result: {period_check.download_result}")
+            else:
+                agent.add_new_task("Now, for the currently selected statement period, expand every visible transaction row and use the evaluate action to extract each row's date, description, reference number, amount, and closing balance — the same way described earlier. If more pages exist, paginate through all of them, up to 5 pagination clicks. Populate the transactions list with only what the JavaScript extraction literally returns.")
+                period_transactions_history = await agent.run()
+                period_transactions_check, ok = check_result(period_transactions_history, "Transaction extraction result")
+                if ok:
+                    print(f"Transactions found for '{selected_period}': {len(period_transactions_check.transactions)}")
+                    for txn in period_transactions_check.transactions:
+                        print(f"  {txn.date} | {txn.description} | {txn.reference_number} | {txn.amount} | {txn.closing_balance}")
+                    saved_path = save_transactions_to_csv(period_transactions_check.transactions, selected_period)
+                    print(f"Transactions also saved to: {saved_path}")
+
+    if not succeeded:
+        print("User did not select a correct period")
+
 agent = Agent(
     task = """Rules, in priority order:
     1. Go to https://now.hdfc.bank.in/retail-app/ and log in with username x_username and password x_password. Set login_attempted to true.
@@ -62,10 +146,9 @@ agent = Agent(
     5. If an OTP entry screen appears at any point — during login or afterward — stop completely, set otp_screen_reached to true, and do nothing further.
     6. If login succeeds with no CAPTCHA or OTP, navigate to wherever account statements or transaction history are viewable.
     7. If reaching that page triggers anything covered by rules 3-5, apply them there too.
-    8. Once you reach the statement page, select "Recent Transactions" as the statement period. For each transaction row visible, click its panel toggle to expand it and reveal its full details, then use the evaluate action to extract that row's date, description, reference number, amount, and closing balance from the expanded panel. Repeat for every row visible on the page. Populate the transactions list only with data that literally appears in the JavaScript extraction results — do not summarize, paraphrase, or add any detail not directly present. If a field is genuinely not available even after expanding a row, use an empty string rather than guessing.
-    9. After extracting all rows currently visible, check whether more transactions exist beyond what's shown — for example, a "Next" control, page numbers, or text like "1-10 of 20". If more exist, navigate to the next page and repeat the same expand-and-extract process for every row there, adding to the same transactions list rather than replacing it. Continue until every page has been covered or no further page control exists. Do not click a pagination control more than 5 times in a row, to avoid looping indefinitely if the page doesn't behave as expected.
-    10. Before setting any field, gather concrete evidence using the evaluate action — read the actual page URL and visible text. Do not rely on a visual impression alone.
-    11. If anything happens that doesn't match these cases, describe it in unexpected_state; otherwise leave that field empty.""",
+    8. Once you reach the statement page, use the evaluate action to read ONLY the statement-period dropdown element's own <option> values and the current URL. Do NOT read or return the page's full visible text or body content, since the default view may already show real transaction rows — capturing that would violate rule 8's own restriction below. Populate available_periods with the literal text of every dropdown option found. Do NOT select any period yet, and do NOT expand or extract any transaction rows. Stop here once the list is reported.
+    9. Before setting any field, gather concrete evidence using the evaluate action — but never read more of the page than a specific rule calls for. On the statement page during discovery, that means only the dropdown's own options and the URL, per rule 8 — not the full page body.
+    10. If anything happens that doesn't match these cases, describe it in unexpected_state; otherwise leave that field empty.""",
     # Vision disabled deliberately
     use_vision = False,
     llm = llm,
@@ -80,19 +163,9 @@ async def main():
     try:
         await browser_session.start()
         login_history = await agent.run()
-        account_check = login_history.structured_output
-
-        if account_check is None:
-            print("The agent never produced a result — check the log for what went wrong.")
+        account_check, ok = check_result(login_history, "Login/statement result")
+        if not ok:
             return
-        
-        # Judge checks below are informational only — they never block or reverse an action that already happened.
-        login_judgement = login_history.history[-1].result[-1].judgement
-        if login_judgement is None:
-            print("No judge verdict was produced for the login/statement result — treat this as unverified.")
-        elif not login_judgement.verdict:
-            print("⚠️ WARNING: The judge does NOT agree with the agent's report — treat this result with caution.")
-            print(f"Judge's reason: {login_judgement.failure_reason}")
         print(f"Login attempted: {account_check.login_attempted}")
         print(f"Login error: {account_check.login_error}")
         print(f"CAPTCHA encountered: {account_check.captcha_encountered}")
@@ -102,7 +175,12 @@ async def main():
         print(f"Statement page reached: {account_check.statement_page_reached}")
         print(f"Statement page description: {account_check.statement_page_description}")
 
-        if account_check.captcha_encountered:
+        if(account_check.available_periods):
+            await select_period_and_extract(agent, account_check.available_periods)
+        elif not account_check.otp_screen_reached and not account_check.captcha_encountered:
+            print("No statement periods were discovered — period selection was skipped.")
+
+        if (account_check.captcha_encountered):
             print("A CAPTCHA appeared. This script has stopped and will not attempt it.")
             print("Open your browser normally, log in yourself, and complete this task by hand.")
 
@@ -115,42 +193,17 @@ async def main():
             sensitive_data['x_otp'] = otp_code
             agent.add_new_task("Enter x_otp into the OTP field and submit it. Set otp_submission_succeeded to true only if you can point to concrete evidence of success (like reaching an authenticated page), or false otherwise. Set otp_submission_result to describe exactly what happened — success and what page you reached, or the exact error shown.")
             otp_history = await agent.run()
-            otp_result = otp_history.structured_output
-            otp_judgement = otp_history.history[-1].result[-1].judgement
-
-            if otp_result is None:
-                print("The OTP submission run never produced a result — check the log for what went wrong.")
-            else:
-                if otp_judgement is None:
-                    print("No judge verdict was produced for the OTP submission — treat this result as unverified.")
-                elif not otp_judgement.verdict:
-                    print("⚠️ WARNING: The judge does NOT agree the OTP submission was properly verified.")
-                    print(f"Judge's reason: {otp_judgement.failure_reason}")
-
-                if (otp_result.otp_submission_succeeded):
-                    agent.add_new_task("Now navigate to wherever account statements are viewable and extract the Recent Transactions using the same evaluate-based approach as mentioned in the rules.")
-                    post_otp_history = await agent.run()
-                    post_otp_check = post_otp_history.structured_output
-
-                    if (post_otp_check is not None):
-                        post_otp_judgement = post_otp_history.history[-1].result[-1].judgement
-
-                        if post_otp_judgement is None:
-                            print("No judge verdict was produced for the post-OTP transactions — treat this result as unverified.")
-                        elif not post_otp_judgement.verdict:
-                            print("⚠️ WARNING: The judge does NOT agree the post-OTP transactions were properly verified.")
-                            print(f"Judge's reason: {post_otp_judgement.failure_reason}")
-                        print(f"Transactions found after OTP: {len(post_otp_check.transactions)}")
-                        for txn in post_otp_check.transactions:
-                            print(f"  {txn.date} | {txn.description} | {txn.reference_number} | {txn.amount} | {txn.closing_balance}")
-                    else:
-                        print("The navigation did not work properly!")
-                else:
-                    print(f"OTP submission failed: {otp_result.otp_submission_result}")
-
-        print(f"Transactions found: {len(account_check.transactions)}")
-        for txn in account_check.transactions:
-            print(f"  {txn.date} | {txn.description} | {txn.reference_number} | {txn.amount} | {txn.closing_balance}")
+            otp_result, ok = check_result(otp_history, "OTP submission result")
+            if ok and otp_result.otp_submission_succeeded:
+                agent.add_new_task("Navigate to wherever account statements are viewable. Once there, use the evaluate action to read ONLY the statement-period dropdown element's own <option> values and the current URL. Do NOT read or return the page's full visible text or body content, since the default view may already show real transaction rows. Populate available_periods with the literal text of every option found. Do NOT select any period yet, and do NOT expand or extract any transaction rows. Stop here once the list is reported.")
+                post_otp_discovery_history = await agent.run()
+                post_otp_discovery_check, ok = check_result(post_otp_discovery_history, "Post-OTP period discovery result")
+                if ok and post_otp_discovery_check.available_periods:
+                    await select_period_and_extract(agent, post_otp_discovery_check.available_periods)
+                elif ok:
+                    print("No statement periods were discovered after OTP — period selection was skipped.")
+            elif ok:
+                print(f"OTP submission failed: {otp_result.otp_submission_result}")
     finally:
         await browser_session.kill()
 
