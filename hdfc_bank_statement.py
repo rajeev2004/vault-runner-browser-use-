@@ -46,7 +46,10 @@ class AccountCheck(BaseModel):
     period_selection_error: str
     download_only: bool
     download_result: str
+    available_transaction_filters: list[str]
+    applied_transaction_filter: str
 
+#logging function: runs after every step
 def log_step(browser_state, agent_output, step_number):
         log = {
             "timestamp" : datetime.now().isoformat(),
@@ -59,6 +62,7 @@ def write_log(entry):
     with open("statement_log.json1", "a") as f:
         f.write(f"{json.dumps(entry)}\n")
 
+#function that is used when we have to input custom dates
 def get_valid_date(prompt):
     while True:
         date_str = input(prompt).strip()
@@ -72,6 +76,7 @@ def get_valid_date(prompt):
             continue
         return date_str
 
+#function used for chekcing final results and agent's state, and whether the judge is okay with the agent behaviour or not
 def check_result(history, run_name):
     result = history.structured_output
     if result is None:
@@ -85,6 +90,7 @@ def check_result(history, run_name):
         print(f"Judge's reason: {judgement.failure_reason}")
     return result, True
 
+#function used to downlaod a csv file where the download option is not given
 def save_transactions_to_csv(transactions, period_name):
     filename = f"transactions_{period_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     with open(filename, "w", newline="") as f:
@@ -94,6 +100,7 @@ def save_transactions_to_csv(transactions, period_name):
             writer.writerow([txn.date, txn.description, txn.reference_number, txn.amount, txn.closing_balance])
     return filename
 
+#function which naviages the whole transaction-history page: selects the period, transaction type, and then downloads the result
 async def select_period_and_extract(agent, available_periods):
     max_attempts = 3
     attempt = 0
@@ -124,10 +131,24 @@ async def select_period_and_extract(agent, available_periods):
             if period_check.download_only:
                 print(f"'{selected_period}' offered only a Download option. Result: {period_check.download_result}")
             else:
-                agent.add_new_task("Now, for the currently selected statement period, expand every visible transaction row and use the evaluate action to extract each row's date, description, reference number, amount, and closing balance — the same way described earlier. If more pages exist, paginate through all of them, up to 5 pagination clicks. Populate the transactions list with only what the JavaScript extraction literally returns.")
+                agent.add_new_task("On the currently selected statement page, use the evaluate action to read the actual list of options from the transaction-type filter control (a dropdown or similar offering choices for all transactions vs. only credits vs. only debits). Populate available_transaction_filters with the literal text of every option found. Do NOT change the current filter, and do NOT expand or extract any transaction rows yet.")
+                filter_discovery_history = await agent.run()
+                filter_discovery_check, ok = check_result(filter_discovery_history, "Transaction filter discovery result")
+
+                chosen_filter = None
+                if ok and filter_discovery_check.available_transaction_filters:
+                    for f in filter_discovery_check.available_transaction_filters:
+                        print(f)
+                    chosen_filter = input("Which transaction filter would you like?: ").strip()
+                    while chosen_filter not in filter_discovery_check.available_transaction_filters:
+                        chosen_filter = input(f"Please choose one of: {', '.join(filter_discovery_check.available_transaction_filters)}: ").strip()
+                filter_instruction = f"first select the transaction-type filter to '{chosen_filter}' if it is not already set, then use the evaluate action to read the filter control's actual current value and set applied_transaction_filter to exactly what that evaluate call returns" if chosen_filter else "leave the transaction-type filter as-is and set applied_transaction_filter to its current value, read via evaluate"
+                agent.add_new_task(f"Now, for the currently selected statement period, {filter_instruction}. Then expand every visible transaction row and use the evaluate action to extract each row's date, description, reference number, amount, and closing balance. After collecting the currently visible rows, use the evaluate action to explicitly look for a real 'Next' button, arrow, or page-number control — for example, an element whose aria-label or text contains 'Next', or numbered page links. Do not conclude that no further pages exist based on an identifier search alone; you must actually check for a visible, working pagination control. If one is found and enabled, click it and repeat row expansion and extraction for the new page, adding to the same transactions list rather than replacing it. Continue until the pagination control is disabled, absent, or you have clicked it 5 times, whichever comes first. Populate the transactions list with only what the JavaScript extraction literally returns.")
                 period_transactions_history = await agent.run()
                 period_transactions_check, ok = check_result(period_transactions_history, "Transaction extraction result")
                 if ok:
+                    if chosen_filter and period_transactions_check.applied_transaction_filter != chosen_filter:
+                        print(f"⚠️ Requested filter '{chosen_filter}' but the page actually shows: {period_transactions_check.applied_transaction_filter}")
                     print(f"Transactions found for '{selected_period}': {len(period_transactions_check.transactions)}")
                     for txn in period_transactions_check.transactions:
                         print(f"  {txn.date} | {txn.description} | {txn.reference_number} | {txn.amount} | {txn.closing_balance}")
@@ -137,6 +158,7 @@ async def select_period_and_extract(agent, available_periods):
     if not succeeded:
         print("User did not select a correct period")
 
+#this describes the agent
 agent = Agent(
     task = """Rules, in priority order:
     1. Go to https://now.hdfc.bank.in/retail-app/ and log in with username x_username and password x_password. Set login_attempted to true.
